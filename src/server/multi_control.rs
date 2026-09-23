@@ -1138,12 +1138,14 @@ fn on_helper_mouse(
         MOUSE_TYPE_WHEEL | MOUSE_TYPE_TRACKPAD => {
             if own.is_some() {
                 renew_borrow(st, conn, now);
+                arm_scroll_grace(st, conn, now);
                 clear_notice(st, conn);
                 return Planned::with(Vec::new(), Action::Inject);
             }
             match can_start_borrow(st, conn, now) {
                 Ok((x, y)) => {
                     start_borrow(st, conn, BorrowKind::Scroll, now);
+                    arm_scroll_grace(st, conn, now);
                     Planned::with(notify_all(st), Action::LocateThenInject { x, y })
                 }
                 Err(reject) => {
@@ -1163,11 +1165,35 @@ fn on_helper_mouse(
     }
 }
 
+/// The peer goes on with the gesture this borrow is: its liveness is renewed and any
+/// deadline that was about to end the gesture is dropped, because the gesture continues.
 fn renew_borrow(st: &mut State, conn: i32, now: Instant) {
     if let Some(borrow) = st.borrow.as_mut() {
         if borrow.peer == conn {
             borrow.last_seen = now;
             borrow.grace_until = None;
+        }
+    }
+}
+
+/// Liveness of a borrow, without touching the gesture it carries.
+///
+/// A message that says nothing about what the peer is doing may not drop the deadline that
+/// ends a click or a scroll: a peer that keeps renewing itself would hold the pointer until
+/// it disconnects, and no other controller could borrow it in the meantime.
+fn touch_borrow(st: &mut State, conn: i32, now: Instant) {
+    if let Some(borrow) = st.borrow.as_mut() {
+        if borrow.peer == conn {
+            borrow.last_seen = now;
+        }
+    }
+}
+
+/// A scroll is given back as soon as its steps stop, so every step moves its deadline.
+fn arm_scroll_grace(st: &mut State, conn: i32, now: Instant) {
+    if let Some(borrow) = st.borrow.as_mut() {
+        if borrow.peer == conn {
+            borrow.grace_until = Some(now + SCROLL_GRACE);
         }
     }
 }
@@ -1293,8 +1319,15 @@ fn on_borrow_in(
     match request {
         BorrowRequest::Begin => {
             if own.is_some() {
-                // Idempotent: a repeated begin only renews the same borrow.
-                renew_borrow(st, conn, now);
+                // A repeated begin of the borrow the key already owns, and a begin that
+                // arrives while a click or a scroll of the same peer is still live: in both
+                // cases this side now holds its operate key, so the borrow is the one that
+                // key owns - which is also what lets it type.
+                if let Some(borrow) = st.borrow.as_mut() {
+                    borrow.last_seen = now;
+                    borrow.grace_until = None;
+                    borrow.kind = BorrowKind::Continuous;
+                }
                 return Planned::with(
                     Vec::new(),
                     Action::Locate {
@@ -1337,7 +1370,7 @@ fn on_borrow_in(
             if epoch != borrow.epoch {
                 return Planned::with(Vec::new(), Action::Drop(Reject::Suppressed));
             }
-            renew_borrow(st, conn, now);
+            touch_borrow(st, conn, now);
             Planned::with(Vec::new(), Action::Drop(Reject::Suppressed))
         }
     }
@@ -1738,6 +1771,36 @@ mod tests {
     }
 
     #[test]
+    fn a_renewal_does_not_keep_a_finished_gesture_alive() {
+        let now = Instant::now();
+        let mut st = host(now);
+        assert!(injected(&on_mouse_in(
+            &mut st,
+            2,
+            &button(LEFT, MOUSE_TYPE_DOWN),
+            now
+        )));
+        assert!(injected(&on_mouse_in(
+            &mut st,
+            2,
+            &button(LEFT, MOUSE_TYPE_UP),
+            now
+        )));
+        let epoch = st.borrow.expect("borrow").epoch;
+        // The borrowing side renews while it holds the pointer. That is liveness, not a
+        // continuation of the click, so the deadline of the finished click stays where it
+        // was instead of leaving the pointer borrowed until the peer disconnects.
+        let renewed = now + Duration::from_millis(100);
+        on_borrow_in(&mut st, 2, BorrowRequest::Heartbeat, epoch, renewed);
+        assert_eq!(
+            st.borrow.expect("borrow").grace_until,
+            Some(now + CLICK_GRACE)
+        );
+        assert!(!tick_in(&mut st, now + CLICK_GRACE).is_empty());
+        assert!(st.borrow.is_none());
+    }
+
+    #[test]
     fn wheel_values_are_never_read_as_coordinates() {
         let now = Instant::now();
         let mut st = host(now);
@@ -1748,6 +1811,57 @@ mod tests {
             st.borrow.map(|borrow| borrow.kind),
             Some(BorrowKind::Scroll)
         );
+    }
+
+    #[test]
+    fn a_scroll_gives_the_pointer_back_when_its_steps_stop() {
+        let now = Instant::now();
+        let mut st = host(now);
+        assert!(injected(&on_mouse_in(&mut st, 2, &wheel(), now)));
+        let borrow = st.borrow.expect("borrow");
+        assert_eq!(borrow.kind, BorrowKind::Scroll);
+        assert_eq!(borrow.grace_until, Some(now + SCROLL_GRACE));
+        // Another step of the same gesture moves the deadline instead of ending it.
+        let later = now + SCROLL_GRACE / 2;
+        assert!(injected(&on_mouse_in(&mut st, 2, &wheel(), later)));
+        assert_eq!(
+            st.borrow.expect("borrow").grace_until,
+            Some(later + SCROLL_GRACE)
+        );
+        // The peer keeps renewing the borrow, and it still ends by itself: nothing has to
+        // happen for the pointer to go back to the primary.
+        let epoch = st.borrow.expect("borrow").epoch;
+        on_borrow_in(&mut st, 2, BorrowRequest::Heartbeat, epoch, later);
+        assert!(!tick_in(&mut st, later + SCROLL_GRACE).is_empty());
+        assert!(st.borrow.is_none());
+    }
+
+    #[test]
+    fn a_scroll_inside_a_live_borrow_keeps_a_deadline() {
+        let now = Instant::now();
+        let mut st = host(now);
+        // A click that is still inside its grace, then a scroll instead of another click.
+        assert!(injected(&on_mouse_in(
+            &mut st,
+            2,
+            &button(LEFT, MOUSE_TYPE_DOWN),
+            now
+        )));
+        assert!(injected(&on_mouse_in(
+            &mut st,
+            2,
+            &button(LEFT, MOUSE_TYPE_UP),
+            now
+        )));
+        let scrolled = now + Duration::from_millis(100);
+        assert!(injected(&on_mouse_in(&mut st, 2, &wheel(), scrolled)));
+        // The click's deadline was given up for the scroll, so the scroll carries its own.
+        assert_eq!(
+            st.borrow.expect("borrow").grace_until,
+            Some(scrolled + SCROLL_GRACE)
+        );
+        assert!(!tick_in(&mut st, scrolled + SCROLL_GRACE).is_empty());
+        assert!(st.borrow.is_none());
     }
 
     #[test]
@@ -2613,6 +2727,38 @@ mod tests {
 
         let mut st = host(now);
         assert!(notifies(&on_mouse_in(&mut st, 2, &wheel(), now).commands));
+    }
+
+    #[test]
+    fn the_operate_key_takes_over_a_borrow_that_is_still_live() {
+        let now = Instant::now();
+        let mut st = host(now);
+        // A click that borrowed the pointer, still inside its grace.
+        assert!(injected(&on_mouse_in(
+            &mut st,
+            2,
+            &button(LEFT, MOUSE_TYPE_DOWN),
+            now
+        )));
+        assert!(injected(&on_mouse_in(
+            &mut st,
+            2,
+            &button(LEFT, MOUSE_TYPE_UP),
+            now
+        )));
+        assert!(!snapshot_in(&st, 2).keyboard_target_confirmed);
+        // The operate key goes down: the peer means to type where it just clicked, so the
+        // borrow becomes the one the key owns instead of staying the finished click.
+        let begin = on_borrow_in(&mut st, 2, BorrowRequest::Begin, 0, now);
+        assert_eq!(begin.action, Action::Locate { x: 20, y: 20 });
+        let borrow = st.borrow.expect("borrow");
+        assert_eq!(borrow.kind, BorrowKind::Continuous);
+        assert_eq!(borrow.grace_until, None);
+        assert!(snapshot_in(&st, 2).keyboard_target_confirmed);
+        // The release of the key ends the borrow it owns.
+        let epoch = borrow.epoch;
+        on_borrow_in(&mut st, 2, BorrowRequest::End, epoch, now);
+        assert!(st.borrow.is_none());
     }
 
     #[test]
